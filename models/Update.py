@@ -118,27 +118,13 @@ def train(step, args, net, client_loader, learning_rate, info,
             }
             weight = lr * (args.lr_decay ** step) / max(len(indices), 1)
 
-            # Chuẩn bị batch images từ base_dataset
-            batch_imgs_list = []
-            batch_lbls_list = []
-            valid_count = 0
-            for local_idx, lbl in zip(indices.tolist(), labels.tolist()):
-                try:
-                    img_i, lbl_i = base_dataset[local_idx]
-                except IndexError:
-                    continue
-                if not isinstance(img_i, torch.Tensor):
-                    img_i = torch.tensor(img_i, dtype=torch.float32)
-                batch_imgs_list.append(img_i)
-                batch_lbls_list.append(lbl_i)
-                valid_count += 1
+            # Dùng thẳng images/labels đã có trong batch — không cần load lại
+            # từ base_dataset (tránh B lần dataset[idx] thừa mỗi batch).
+            batch_imgs = images.to(args.device)   # (B, ...)
+            batch_lbls = labels.to(args.device)   # (B,)
+            valid_count = batch_imgs.shape[0]
 
-            if valid_count == 0:
-                pass
-            else:
-                batch_imgs = torch.stack(batch_imgs_list).to(args.device)  # (B, ...)
-                batch_lbls = torch.tensor(batch_lbls_list, dtype=torch.long).to(args.device)
-
+            if valid_count > 0:
                 grad_batch, C_batch = _compute_batch_sketch(
                     net, base_state, spec, batch_imgs, batch_lbls,
                     args.device, loss_func, U,
