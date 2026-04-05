@@ -228,29 +228,33 @@ def _compute_batch_sketch(model, base_state, spec, images, labels,
                            device, loss_func, U):
     """Compute projected gradient and curvature for a FULL BATCH efficiently.
 
-    Instead of calling _compute_per_sample_ggn B times (B × C backward passes),
-    this function uses torch.func.vmap + jacrev to vectorize the Jacobian
-    computation across the entire batch in a single vmapped call.
+    Uses torch.func.vmap + jacrev to vectorize per-sample Jacobian computation.
 
-    Cost: O(C) vmapped forward passes instead of O(B × C) separate passes.
-    Speedup: ~B× faster (batch_size = 64 → ~60x speedup over the loop).
+    Key design decisions vs. previous version:
+    1.  NO double forward pass: logits are extracted as auxiliary output from
+        jacrev using has_aux=True, so we never run a second vmap(f)(images).
+    2.  NO full state_dict clone inside vmap: f_single receives only the
+        selected-layer vector (sel_vec) as a differentiable argument.
+        Non-selected parameters are captured as a fixed dict overlay computed
+        ONCE outside the closure, keeping the per-sample overhead minimal.
 
-    Follows the same math as _compute_per_sample_ggn:
-        J_i   = jacrev(f)(x_i)           shape (C, d)
-        H_ell = diag(p_i) - p_i p_i^T    shape (C, C)
+    Math (same as _compute_per_sample_ggn):
+        J_i   = ∂logits_i/∂sel_vec       shape (C, d)
+        p_i   = softmax(logits_i)         shape (C,)
+        H_ell = diag(p_i) - p_i p_i^T    shape (C, C)   exact softmax Hessian
         GGN_i = J_i^T H_ell J_i          shape (d, d)
-        s_k   = U^T mean(grad_i)          shape (r,)
-        C_k   = U^T mean(GGN_i) U         shape (r, r)
+        s_k   = U^T mean_i(grad_i)       shape (r,)
+        C_k   = U^T mean_i(GGN_i) U      shape (r, r)
 
     Parameters
     ----------
     model      : nn.Module   current model (eval mode)
-    base_state : dict        state_dict snapshot
+    base_state : dict        state_dict snapshot (full model)
     spec       : SelectedParameterSpec
     images     : Tensor  float32  shape (B, ...)  on device
     labels     : Tensor  int64    shape (B,)       on device
     device     : torch.device
-    loss_func  : CrossEntropyLoss
+    loss_func  : CrossEntropyLoss  (unused in fast path — grad computed analytically)
     U          : Tensor  float64  shape (d, r)  on cpu
 
     Returns
@@ -261,7 +265,7 @@ def _compute_batch_sketch(model, base_state, spec, images, labels,
     try:
         from torch.func import functional_call, vmap, jacrev
     except ImportError:
-        # PyTorch < 2.0 fallback: per-sample loop
+        # PyTorch < 2.0 fallback: per-sample loop (mirrors fusg_utils.py reference)
         B = images.shape[0]
         s_acc = torch.zeros(U.shape[1], dtype=torch.float64)
         C_acc = torch.zeros(U.shape[1], U.shape[1], dtype=torch.float64)
@@ -273,33 +277,55 @@ def _compute_batch_sketch(model, base_state, spec, images, labels,
             C_acc += U.t() @ curv @ U
         return s_acc / B, C_acc / B
 
-    # ── Extract selected parameters as a single vector ────────────────────────
+    # ── Selected vector (differentiable) — extracted ONCE outside closure ─────
     selected_vector = _flatten_selected(model, spec).detach().to(
         device=device, dtype=torch.float32)
-    d = selected_vector.shape[0]
     r = U.shape[1]
 
-    # ── Define per-sample function: x -> logits (selected params as input) ───
+    # ── Build a fixed overlay for non-selected params — computed ONCE ─────────
+    # Only selected params are replaced per-call; everything else is fixed.
+    # This avoids cloning the entire state_dict inside the vmap'd closure.
+    non_selected_overlay = {
+        name: tensor.detach()
+        for name, tensor in base_state.items()
+        if name not in set(spec.names)
+    }
+
     def f_single(sel_vec, x):
-        """Forward pass with sel_vec replacing selected layer params."""
-        state = _build_state_with_vector(base_state, spec, sel_vec)
-        out   = functional_call(model, state, (x.unsqueeze(0),))
+        """Forward pass: sel_vec is differentiable; non-selected params fixed.
+
+        Returns (logits, logits) — logits as both primary output and aux,
+        so jacrev with has_aux=True gives us J AND logits in one pass.
+        """
+        # Rebuild only the selected layer slice from sel_vec
+        overlay = dict(non_selected_overlay)   # shallow copy of fixed part
+        vec = sel_vec.reshape(-1)
+        for (start, end), pname, shape, ref in zip(
+            spec.offsets, spec.names, spec.shapes,
+            [base_state[n] for n in spec.names]
+        ):
+            overlay[pname] = vec[start:end].to(
+                device=ref.device, dtype=ref.dtype).view(shape)
+
+        out = functional_call(model, overlay, (x.unsqueeze(0),))
         if hasattr(out, "logits"):
             out = out.logits
         if isinstance(out, (tuple, list)):
             out = out[0]
-        return out.reshape(-1)   # shape (C,)
+        logits = out.reshape(-1)   # shape (C,)
+        return logits, logits      # (primary for jacrev, aux for free logits)
 
-    # ── Vectorized Jacobian: vmap(jacrev(f))(images) ─────────────────────────
-    # jacrev differentiates f w.r.t. its FIRST argument (sel_vec).
-    # vmap maps it over the batch dimension of images.
-    # Result J: shape (B, C, d)
+    # ── Vectorized Jacobian + logits in ONE pass via has_aux=True ────────────
+    # jacrev(..., has_aux=True): differentiates w.r.t. first output (logits),
+    # and passes the second output (aux logits) through unchanged.
+    # vmap maps over images batch dimension.
+    # J_batch: (B, C, d)   logits_batch: (B, C)
     try:
-        jac_fn  = jacrev(f_single)   # grad w.r.t. sel_vec
-        J_batch = vmap(jac_fn, in_dims=(None, 0))(
-            selected_vector, images)   # (B, C, d)
+        jac_fn       = jacrev(f_single, has_aux=True)
+        J_batch, logits_batch = vmap(jac_fn, in_dims=(None, 0))(
+            selected_vector, images)   # J: (B,C,d), logits: (B,C)
     except Exception:
-        # vmap/jacrev unavailable or failed — fall back to loop
+        # Fallback to per-sample loop if vmap/jacrev fails
         B = images.shape[0]
         s_acc = torch.zeros(r, dtype=torch.float64)
         C_acc = torch.zeros(r, r, dtype=torch.float64)
@@ -311,51 +337,32 @@ def _compute_batch_sketch(model, base_state, spec, images, labels,
             C_acc += U.t() @ curv @ U
         return s_acc / B, C_acc / B
 
-    # ── Per-sample gradient of loss ──────────────────────────────────────────
-    # g_i = J_i^T * (d_loss/d_logits)_i   shape (B, d)
-    # Use mean across batch for s_k
-    B = J_batch.shape[0]
-    J64 = J_batch.detach().to(dtype=torch.float64, device="cpu")   # (B, C, d)
+    # ── Move to CPU float64 for all subsequent numerics ───────────────────────
+    B   = J_batch.shape[0]
+    J64 = J_batch.detach().to(dtype=torch.float64, device="cpu")            # (B, C, d)
+    logits_cpu  = logits_batch.detach().to(dtype=torch.float64, device="cpu")  # (B, C)
+    probs_batch = torch.softmax(logits_cpu, dim=-1)                         # (B, C)
 
-    # Compute softmax probs and H_ell per sample
-    with torch.no_grad():
-        logits_batch = vmap(lambda x: f_single(selected_vector, x))(images)
-        # shape (B, C)
-
-    logits_cpu = logits_batch.detach().to(dtype=torch.float64, device="cpu")
-    probs_batch = torch.softmax(logits_cpu, dim=-1)   # (B, C)
-
-    # ── Gradient of cross-entropy w.r.t. logits: p - one_hot(y) ─────────────
+    # ── Gradient: dL/dlogits = p - one_hot(y), then g_i = J_i^T (p_i - y_i) ─
     labels_cpu = labels.cpu()
     one_hot    = torch.zeros_like(probs_batch)
     one_hot.scatter_(1, labels_cpu.unsqueeze(1).long(), 1.0)
-    dL_dlogits = probs_batch - one_hot                 # (B, C)
+    dL_dlogits   = probs_batch - one_hot                                    # (B, C)
+    grad_batch_d = torch.einsum('bcd,bc->bd', J64, dL_dlogits)             # (B, d)
+    grad_mean_d  = grad_batch_d.mean(dim=0)                                 # (d,)
+    s_k          = U.t().to(dtype=torch.float64) @ grad_mean_d             # (r,)
 
-    # g_i = J_i^T dL_dlogits_i   shape (B, d)
-    # einsum: b=batch, c=class, d=param
-    grad_batch_d = torch.einsum('bcd,bc->bd', J64, dL_dlogits)   # (B, d)
-    grad_mean_d  = grad_batch_d.mean(dim=0)                       # (d,)
-    s_k          = U.t().to(dtype=torch.float64) @ grad_mean_d    # (r,)
+    # ── GGN = J^T H_ell J,  H_ell = diag(p) - p p^T ─────────────────────────
+    # Efficient factored form (no explicit H_ell matrix):
+    #   J^T H_ell J = J^T diag(p) J  -  (J^T p)(J^T p)^T
+    p     = probs_batch                                                     # (B, C)
+    JtDJ  = torch.einsum('bcd,bc,bce->bde', J64, p, J64)                   # (B, d, d)
+    Jtp   = torch.einsum('bcd,bc->bd',      J64, p)                        # (B, d)
+    JtppJ = torch.einsum('bd,be->bde',      Jtp, Jtp)                      # (B, d, d)
 
-    # ── GGN = J^T H_ell J per sample, then mean ──────────────────────────────
-    # H_ell_i = diag(p_i) - p_i p_i^T
-    # GGN_i   = J_i^T H_ell_i J_i   shape (d, d)
-    # Efficient: GGN_i = J_i^T (diag(p) J_i) - J_i^T (p p^T J_i)
-    #          = J_i^T diag(p) J_i - (J_i^T p)(p^T J_i)
-
-    # (B, d, d) via einsum
-    # Step 1: J^T diag(p) J  = einsum('bcd,bc,bce->bde', J, p, J)
-    # Step 2: (J^T p)(p^T J) = einsum('bcd,bc->bd', J, p) outer product
-    p = probs_batch                                          # (B, C)
-    JtDJ  = torch.einsum('bcd,bc,bce->bde', J64, p, J64)   # (B, d, d)
-    Jtp   = torch.einsum('bcd,bc->bd', J64, p)             # (B, d)
-    JtppJ = torch.einsum('bd,be->bde', Jtp, Jtp)           # (B, d, d)
-
-    GGN_batch = JtDJ - JtppJ                                # (B, d, d)
-    GGN_mean  = GGN_batch.mean(dim=0)                       # (d, d)
-
+    GGN_mean = (JtDJ - JtppJ).mean(dim=0)                                  # (d, d)
     U64 = U.to(dtype=torch.float64)
-    C_k = U64.t() @ GGN_mean @ U64                          # (r, r)
+    C_k = U64.t() @ GGN_mean @ U64                                         # (r, r)
 
     return s_k, C_k
 
